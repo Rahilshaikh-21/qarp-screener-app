@@ -533,7 +533,7 @@ with tab2:
 
         st.divider()
         st.subheader(f"📈 15 Saal Backtest: {csym} vs Nifty 50")
-        if st.button("📈 15 Saal Backtest Chalao", key="bt_single"):
+        if st.button("📈 15 Saal Backtest Chalao", key="btn_single"):
             with st.spinner("15 saal ka price data la raha hoon..."):
                 try:
                     st.session_state["bt_single"] = (csym, run_backtest([csym], 15))
@@ -609,7 +609,7 @@ with tab3:
                            "Khaali wale stock backtest me nahi judenge.")
                 edited = st.data_editor(st.session_state["map_df"], key=f"map_{abs(hash(mkey))}",
                                         use_container_width=True, hide_index=True)
-                if st.button("📈 15 Saal Backtest Chalao (Nifty 50 se compare)", key="bt_file"):
+                if st.button("📈 15 Saal Backtest Chalao (Nifty 50 se compare)", key="btn_file"):
                     syms = [str(x).strip().upper() for x in edited["NSE Symbol"]
                             if str(x).strip() and str(x).strip().lower() != "nan"]
                     if not syms:
