@@ -462,16 +462,31 @@ with tab3:
     if f:
         df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
         df.columns = df.columns.str.strip()
-        sg = next((c for c in df.columns if "sales" in c.lower() and "growth" in c.lower()), None)
-        pg = next((c for c in df.columns if "profit" in c.lower() and "growth" in c.lower()), None)
-        df = df.rename(columns={"P/E": "PE", "Debt to equity": "DE"})
-        if sg: df = df.rename(columns={sg: "Sales_CAGR"})
-        if pg: df = df.rename(columns={pg: "Profit_CAGR"})
+
+        def find(*keys, avoid=("qtr", "var %", "avg", "average", "median")):
+            """Screener ke alag-alag column naam pehchano (jaise 'ROCE %', 'Debt / Eq')."""
+            for c in df.columns:
+                lc = c.lower()
+                if all(k in lc for k in keys) and not any(a in lc for a in avoid):
+                    return c
+            return None
+
+        mapping = {
+            "Name": find("name"),
+            "Price": find("cmp") or find("current price"),
+            "PE": find("p/e") or find("price to earning"),
+            "ROCE": find("roce") or find("return on capital"),
+            "DE": find("debt", "eq"),
+            "Sales_CAGR": find("sales", "growth") or find("sales", "cagr"),
+            "Profit_CAGR": find("profit", "growth") or find("profit", "cagr"),
+        }
+        df = df.rename(columns={v: k for k, v in mapping.items() if v})
+        st.caption("Pehchane gaye columns: " + ", ".join(f"{k} ← {v}" for k, v in mapping.items() if v))
         for c in ["PE", "ROCE", "DE", "Sales_CAGR", "Profit_CAGR"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         if not {"ROCE", "PE", "DE"}.issubset(df.columns):
-            st.error("ROCE, P/E aur Debt to equity columns zaroori hain.")
+            st.error("ROCE, P/E aur Debt/Equity columns nahi mile. Screener me Edit Columns se inhe add karke dobara export karein.")
         else:
             m = (df["ROCE"] >= roce_min) & (df["DE"] <= de_max) & (df["PE"] > 0) & (df["PE"] < pe_max)
             if "Sales_CAGR" in df: m &= df["Sales_CAGR"] >= growth_min
