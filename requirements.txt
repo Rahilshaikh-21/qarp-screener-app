@@ -4,4 +4,5 @@ numpy
 yfinance>=0.2.60
 requests
 openpyxl
+matplotlib
 jinja2
