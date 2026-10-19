@@ -1,5 +1,6 @@
 import io
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -47,8 +48,19 @@ def pct(x):
 
 def fetch_stage1(sym):
     """Fast data from yfinance .info"""
+    i = None
+    for attempt in range(3):
+        try:
+            i = yf.Ticker(sym + ".NS").info
+            if i and (i.get("marketCap") or i.get("currentPrice")):
+                break
+        except Exception:
+            pass
+        i = None
+        time.sleep(0.7 * (attempt + 1))  # Yahoo throttle ho to thoda ruk ke retry
+    if not i:
+        return None
     try:
-        i = yf.Ticker(sym + ".NS").info
         de = i.get("debtToEquity")
         ev, ebitda = i.get("enterpriseValue"), i.get("ebitda")
         return {
@@ -168,7 +180,17 @@ with tab1:
             st.stop()
 
         # Stage 1: quick data
-        s1 = pd.DataFrame(run_parallel(fetch_stage1, symbols, "Stage 1: Basic data"))
+        raw = run_parallel(fetch_stage1, symbols, "Stage 1: Basic data", workers=8)
+        st.write(f"Yahoo se data mila: **{len(raw)} / {len(symbols)}** companies")
+        if len(raw) < 0.3 * len(symbols):
+            st.error(
+                "Yahoo Finance ne zyada tar companies ka data nahi diya (rate-limit / block). "
+                "Kya karein: (1) 10-15 minute baad dobara try karein, (2) `pip install -U yfinance` "
+                "karke app local computer par chalayein (Streamlit Cloud ke IP aksar block hote hain), "
+                "ya (3) Tab 2 me Screener.in ki CSV upload karein."
+            )
+            st.stop()
+        s1 = pd.DataFrame(raw)
         for c in ["MCap_Cr", "PE", "ROE", "DE", "Rev_Growth", "EPS_Growth"]:
             s1[c] = pd.to_numeric(s1[c], errors="coerce")
 
@@ -179,6 +201,9 @@ with tab1:
             & (s1["DE"].fillna(0) <= de_max)
         ].copy()
         st.write(f"Stage 1 ke baad **{len(pre)}** companies bachi.")
+        if len(pre) == 0:
+            st.warning("Stage 1 filters ne sab hata diye. Sidebar me ROCE/P/E/Debt dheela karke try karein.")
+            st.stop()
 
         # Quick rank, top 80 ka hi detailed data nikalo
         pre["Earnings_Yield"] = 100 / pre["PE"]
