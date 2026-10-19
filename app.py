@@ -1,3 +1,4 @@
+import difflib
 import io
 import random
 import time
@@ -144,10 +145,10 @@ def run_parallel(fn, items, label, workers=8):
     return results
 
 
-def rank_score(df, use_growth=True):
+def rank_score(df, use_growth=True, roce_col="ROCE"):
     df = df.copy()
     df["Earnings_Yield"] = 100 / df["PE"]
-    df["R_ROCE"] = df["ROCE"].rank(ascending=False)
+    df["R_ROCE"] = df[roce_col].rank(ascending=False)
     df["R_EY"] = df["Earnings_Yield"].rank(ascending=False)
     df["Score"] = df["R_ROCE"] + df["R_EY"]
     if use_growth and "Profit_CAGR" in df and df["Profit_CAGR"].notna().any():
@@ -275,19 +276,95 @@ def yearly_returns(curve):
 
 
 def run_backtest(symbols, years=10):
+    """Returns (both_curves, stock_prices). both = Portfolio vs Nifty 50 (equal-weight, yearly rebalance)."""
     tickers = [s + ".NS" for s in symbols]
     data = yf.download(tickers + ["^NSEI"], period=f"{years}y", auto_adjust=True,
                        progress=False, threads=True)["Close"]
     data = data.dropna(axis=1, how="all").ffill()
     if "^NSEI" not in data.columns:
         raise ValueError("Nifty 50 ka data nahi mila")
-    bench_px = data["^NSEI"]
     stocks = data.drop(columns=["^NSEI"])
+    if stocks.shape[1] == 0:
+        raise ValueError("Kisi bhi stock ka price data nahi mila. Symbols check karein.")
+    bench = (1 + data["^NSEI"].pct_change().iloc[1:]).cumprod()
     port = rebalance_curve(stocks)
-    bench = (1 + bench_px.pct_change().iloc[1:]).cumprod()
     both = pd.concat([port.rename("Portfolio"), bench.rename("Nifty 50")], axis=1).dropna()
     both = both / both.iloc[0]
-    return both, stocks.shape[1]
+    return both, stocks
+
+
+def stock_cagrs(stocks):
+    rows = []
+    for c in stocks.columns:
+        s_ = stocks[c].dropna()
+        if len(s_) < 120:
+            continue
+        yrs = (s_.index[-1] - s_.index[0]).days / 365.25
+        rows.append({"Symbol": str(c).replace(".NS", ""), "Data (saal)": round(yrs, 1),
+                     "CAGR %": round(((s_.iloc[-1] / s_.iloc[0]) ** (1 / yrs) - 1) * 100, 1)})
+    return pd.DataFrame(rows).sort_values("CAGR %", ascending=False) if rows else pd.DataFrame()
+
+
+def show_backtest(both, stocks, label="Portfolio"):
+    both = both.rename(columns={"Portfolio": label})
+    pm, nm = perf_metrics(both[label]), perf_metrics(both["Nifty 50"])
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"{label} CAGR", f"{pm['CAGR %']:.1f}%")
+    c2.metric("Nifty 50 CAGR", f"{nm['CAGR %']:.1f}%")
+    c3.metric("Fark (Alpha)", f"{pm['CAGR %'] - nm['CAGR %']:+.1f}%")
+    st.line_chart(both)
+    st.dataframe(pd.DataFrame({label: pm, "Nifty 50": nm}).round(2), use_container_width=True)
+    yr = pd.DataFrame({f"{label} %": yearly_returns(both[label]),
+                       "Nifty 50 %": yearly_returns(both["Nifty 50"])}).round(1)
+    st.write("Saal-dar-saal return:")
+    st.dataframe(yr.T, use_container_width=True)
+    if stocks.shape[1] > 1:
+        st.write("Har stock ka alag CAGR (data shuru hone se aaj tak):")
+        st.dataframe(stock_cagrs(stocks), use_container_width=True, hide_index=True)
+    st.caption(f"{stocks.shape[1]} stock(s), equal-weight, har saal rebalance. Jin stocks ki history poori nahi, "
+               "wo listing ke baad se judte hain. Brokerage/tax/slippage shamil nahi. "
+               "⚠️ Aaj ke chune stocks par purana test hai (look-ahead bias), isliye result zyada achha dikh sakta hai.")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def nse_name_map():
+    r = requests.get(URLS["all"], headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    d = pd.read_csv(io.StringIO(r.text))
+    d.columns = d.columns.str.strip()
+    return dict(zip(d["NAME OF COMPANY"].astype(str).str.lower(), d["SYMBOL"].astype(str)))
+
+
+def _norm(n):
+    n = n.lower().replace(".", " ").replace("&", " and ")
+    for w in (" limited", " ltd", " ind ", " india"):
+        n = n.replace(w, " ")
+    return " ".join(n.split())
+
+
+def match_by_name(name, name_map):
+    """Screener ke chhote naam ko NSE ki list se fuzzy match karo."""
+    q = _norm(name)
+    best, best_sym = 0.0, ""
+    for full, sym in name_map.items():
+        f = _norm(full)
+        score = difflib.SequenceMatcher(None, q, f[:len(q) + 3]).ratio()
+        if score > best:
+            best, best_sym = score, sym
+    return best_sym if best >= 0.75 else ""
+
+
+def guess_ticker(name, name_map=None):
+    try:  # 1) Yahoo search
+        for q in yf.Search(name, max_results=8).quotes:
+            sym = q.get("symbol", "")
+            if sym.endswith(".NS"):
+                return sym[:-3]
+    except Exception:
+        pass
+    if name_map:  # 2) NSE list se fuzzy match
+        return match_by_name(name, name_map)
+    return ""
 
 
 # ================================================================== SIDEBAR
@@ -395,65 +472,76 @@ with tab1:
                     except Exception as e:
                         st.error(f"Backtest fail: {e}")
             if "bt" in st.session_state:
-                both, n = st.session_state["bt"]
-                st.line_chart(both)
-                m = pd.DataFrame({"Portfolio": perf_metrics(both["Portfolio"]),
-                                  "Nifty 50": perf_metrics(both["Nifty 50"])}).round(2)
-                st.dataframe(m, use_container_width=True)
-                yr = pd.DataFrame({"Portfolio %": yearly_returns(both["Portfolio"]),
-                                   "Nifty 50 %": yearly_returns(both["Nifty 50"])}).round(1)
-                st.write("Saal-dar-saal return:")
-                st.dataframe(yr.T, use_container_width=True)
-                st.caption(f"{n} stocks, equal-weight, har saal rebalance. Jin stocks ki history 10 saal "
-                           "puri nahi, wo listing ke baad se judte hain. Brokerage/tax/slippage shamil nahi.")
+                show_backtest(*st.session_state["bt"])
 
         with st.expander("Poora scanned data dekhein"):
             st.dataframe(st.session_state["all"], use_container_width=True)
 
 # ================================================================== TAB 2
 with tab2:
-    st.write("Apna koi bhi NSE stock daalein (jaise `TCS`, `ITC`, `ASIANPAINT`). Fair value, signal aur "
-             "sell-triggers dekhein.")
+    st.write("Apna koi bhi NSE stock daalein (jaise `TCS`, `ITC`, `ASIANPAINT`). Fair value, signal, "
+             "sell-triggers aur 15 saal ka backtest dekhein.")
     sym = st.text_input("NSE Symbol", value="").strip().upper()
+
     if st.button("🔎 Check Karo") and sym:
         with st.spinner("Data la raha hoon..."):
-            a = fetch_stage1(sym)
-            b = fetch_stage2(sym)
-        if not a:
+            a_ = fetch_stage1(sym)
+            b_ = fetch_stage2(sym)
+        if not a_:
+            st.session_state.pop("chk", None)
             st.error("Data nahi mila. Symbol check karein ya thodi der baad try karein.")
         else:
-            r = {**a, **b}
-            v = fair_values(r)
-            sig, why = get_signal(r["Price"], v["Fair_Value"], r["ROCE"], r["DE"], r["Profit_CAGR"])
-            st.subheader(f"{r['Name']} ({sym})")
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Current Price", f"₹{r['Price']:.1f}" if r["Price"] else "NA")
-            k2.metric("Fair Value", f"₹{v['Fair_Value']:.1f}" if v["Fair_Value"] else "NA")
-            if v["Fair_Value"] and r["Price"]:
-                k3.metric("Upside / (Downside)", f"{(v['Fair_Value']/r['Price']-1)*100:.0f}%")
-            k4.metric("Signal", sig)
-            st.info(why)
+            r_ = {**a_, **b_}
+            v_ = fair_values(r_)
+            sg_, why_ = get_signal(r_["Price"], v_["Fair_Value"], r_["ROCE"], r_["DE"], r_["Profit_CAGR"])
+            st.session_state["chk"] = (sym, r_, v_, sg_, why_)
 
-            st.write("**Fair value models**")
-            st.dataframe(pd.DataFrame([{k: (round(x, 1) if x else None) for k, x in v.items()
-                                         if k in ("Graham", "Lynch_PEG", "DCF", "Fair_Value")}]),
-                         use_container_width=True)
+    if "chk" in st.session_state:
+        csym, r, v, sig, why = st.session_state["chk"]
+        st.subheader(f"{r['Name']} ({csym})")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Current Price", f"₹{r['Price']:.1f}" if r["Price"] else "NA")
+        k2.metric("Fair Value", f"₹{v['Fair_Value']:.1f}" if v["Fair_Value"] else "NA")
+        if v["Fair_Value"] and r["Price"]:
+            k3.metric("Upside / (Downside)", f"{(v['Fair_Value']/r['Price']-1)*100:.0f}%")
+        k4.metric("Signal", sig)
+        st.info(why)
 
-            st.write("**Sell-trigger checklist**")
-            def chk(ok, text): st.write(("✅ " if ok else "❌ ") + text)
-            chk(r["ROCE"] is not None and r["ROCE"] >= 15, f"ROCE >= 15%  (abhi: {_num(r['ROCE']) and round(r['ROCE'],1)}%)")
-            chk(r["DE"] is not None and r["DE"] <= 0.5, f"Debt/Equity <= 0.5  (abhi: {_num(r['DE']) and round(r['DE'],2)})")
-            chk(r["Profit_CAGR"] is not None and r["Profit_CAGR"] >= 10, f"Profit CAGR >= 10%  (abhi: {_num(r['Profit_CAGR']) and round(r['Profit_CAGR'],1)}%)")
-            chk(r["Sales_CAGR"] is not None and r["Sales_CAGR"] >= 10, f"Sales CAGR >= 10%  (abhi: {_num(r['Sales_CAGR']) and round(r['Sales_CAGR'],1)}%)")
-            chk(r["PE"] is not None and 0 < r["PE"] < 40, f"P/E < 40  (abhi: {_num(r['PE']) and round(r['PE'],1)})")
+        st.write("**Fair value models**")
+        st.dataframe(pd.DataFrame([{k: (round(x, 1) if x else None) for k, x in v.items()
+                                     if k in ("Graham", "Lynch_PEG", "DCF", "Fair_Value")}]),
+                     use_container_width=True)
 
-            try:
-                h = yf.Ticker(sym + ".NS").history(period="2y")["Close"]
-                chart = pd.DataFrame({"Price": h, "200-DMA": h.rolling(200).mean()}).dropna()
-                st.write("**Price vs 200-DMA** (sirf trend ka reference, sell rule nahi)")
-                st.line_chart(chart)
-            except Exception:
-                pass
+        st.write("**Sell-trigger checklist**")
+        def chk(ok, text): st.write(("✅ " if ok else "❌ ") + text)
+        def rnd(x, n=1):
+            x = _num(x)
+            return "NA" if x is None else round(x, n)
+        chk(_num(r["ROCE"]) is not None and r["ROCE"] >= 15, f"ROCE >= 15%  (abhi: {rnd(r['ROCE'])}%)")
+        chk(_num(r["DE"]) is not None and r["DE"] <= 0.5, f"Debt/Equity <= 0.5  (abhi: {rnd(r['DE'], 2)})")
+        chk(_num(r["Profit_CAGR"]) is not None and r["Profit_CAGR"] >= 10, f"Profit CAGR >= 10%  (abhi: {rnd(r['Profit_CAGR'])}%)")
+        chk(_num(r["Sales_CAGR"]) is not None and r["Sales_CAGR"] >= 10, f"Sales CAGR >= 10%  (abhi: {rnd(r['Sales_CAGR'])}%)")
+        chk(_num(r["PE"]) is not None and 0 < r["PE"] < 40, f"P/E < 40  (abhi: {rnd(r['PE'])})")
+
+        try:
+            h = yf.Ticker(csym + ".NS").history(period="2y")["Close"]
+            chart = pd.DataFrame({"Price": h, "200-DMA": h.rolling(200).mean()}).dropna()
+            st.write("**Price vs 200-DMA** (sirf trend ka reference, sell rule nahi)")
+            st.line_chart(chart)
+        except Exception:
+            pass
+
+        st.divider()
+        st.subheader(f"📈 15 Saal Backtest: {csym} vs Nifty 50")
+        if st.button("📈 15 Saal Backtest Chalao", key="bt_single"):
+            with st.spinner("15 saal ka price data la raha hoon..."):
+                try:
+                    st.session_state["bt_single"] = (csym, run_backtest([csym], 15))
+                except Exception as e:
+                    st.error(f"Backtest fail: {e}")
+        if "bt_single" in st.session_state and st.session_state["bt_single"][0] == csym:
+            both_, stocks_ = st.session_state["bt_single"][1]
+            show_backtest(both_, stocks_, label=csym)
 
 # ================================================================== TAB 3
 with tab3:
@@ -472,17 +560,18 @@ with tab3:
             return None
 
         mapping = {
-            "Name": find("name"),
+            "Name": find("name") or find("company"),
             "Price": find("cmp") or find("current price"),
             "PE": find("p/e") or find("price to earning"),
-            "ROCE": find("roce") or find("return on capital"),
+            "ROCE": find("roce", avoid=("qtr", "var %", "avg", "average", "median", "3yr", "5yr", "7yr", "10yr")) or find("return on capital"),
+            "ROCE_5Y": find("roce", "5yr", avoid=("qtr", "var %")) or find("roce", "5year", avoid=("qtr",)),
             "DE": find("debt", "eq"),
             "Sales_CAGR": find("sales", "growth") or find("sales", "cagr"),
             "Profit_CAGR": find("profit", "growth") or find("profit", "cagr"),
         }
         df = df.rename(columns={v: k for k, v in mapping.items() if v})
         st.caption("Pehchane gaye columns: " + ", ".join(f"{k} ← {v}" for k, v in mapping.items() if v))
-        for c in ["PE", "ROCE", "DE", "Sales_CAGR", "Profit_CAGR"]:
+        for c in ["PE", "ROCE", "ROCE_5Y", "DE", "Sales_CAGR", "Profit_CAGR"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         if not {"ROCE", "PE", "DE"}.issubset(df.columns):
@@ -491,9 +580,48 @@ with tab3:
             m = (df["ROCE"] >= roce_min) & (df["DE"] <= de_max) & (df["PE"] > 0) & (df["PE"] < pe_max)
             if "Sales_CAGR" in df: m &= df["Sales_CAGR"] >= growth_min
             if "Profit_CAGR" in df: m &= df["Profit_CAGR"] >= growth_min
-            out = rank_score(df[m]).head(top_n)
-            st.subheader(f"🏆 Top {len(out)} stocks")
+            basis = "ROCE_5Y" if "ROCE_5Y" in df.columns and df["ROCE_5Y"].notna().any() else "ROCE"
+            out = rank_score(df[m], roce_col=basis).head(top_n)
+            st.subheader(f"🏆 Top {len(out)} stocks (ranking: {basis} + Earnings Yield)")
             st.dataframe(out, use_container_width=True)
+
+            st.divider()
+            st.subheader(f"📈 15 Saal Backtest: ye {len(out)} stocks vs Nifty 50")
+            if "Name" not in out.columns:
+                st.warning("File me company ka naam (Name/Company) column nahi mila, isliye symbol nahi dhoondh sakta.")
+            else:
+                sym_col = next((c for c in df.columns if any(k in c.lower() for k in ("nse", "symbol", "ticker"))), None)
+                names = out["Name"].astype(str).tolist()
+                mkey = "|".join(names)
+                if st.session_state.get("map_key") != mkey:
+                    with st.spinner("Company ke naam se NSE symbol dhoondh raha hoon..."):
+                        try:
+                            nm_map = nse_name_map()
+                        except Exception:
+                            nm_map = None
+                        if sym_col:
+                            guesses = out[sym_col].astype(str).str.replace(".NS", "", regex=False).tolist()
+                        else:
+                            guesses = [guess_ticker(n, nm_map) for n in names]
+                    st.session_state["map_df"] = pd.DataFrame({"Company": names, "NSE Symbol": guesses})
+                    st.session_state["map_key"] = mkey
+                st.caption("Symbol galat ya khaali ho to neeche table me khud sahi kar dein (jaise COALINDIA, HINDZINC). "
+                           "Khaali wale stock backtest me nahi judenge.")
+                edited = st.data_editor(st.session_state["map_df"], key=f"map_{abs(hash(mkey))}",
+                                        use_container_width=True, hide_index=True)
+                if st.button("📈 15 Saal Backtest Chalao (Nifty 50 se compare)", key="bt_file"):
+                    syms = [str(x).strip().upper() for x in edited["NSE Symbol"]
+                            if str(x).strip() and str(x).strip().lower() != "nan"]
+                    if not syms:
+                        st.error("Koi symbol nahi hai. Table me NSE symbol bharein.")
+                    else:
+                        with st.spinner("15 saal ka price data la raha hoon..."):
+                            try:
+                                st.session_state["bt_file"] = run_backtest(syms, 15)
+                            except Exception as e:
+                                st.error(f"Backtest fail: {e}")
+                if "bt_file" in st.session_state:
+                    show_backtest(*st.session_state["bt_file"], label="Top stocks")
 
 # ================================================================== TAB 4
 with tab4:
