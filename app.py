@@ -1,657 +1,621 @@
-import difflib
+"""CoffeeCan + GARP Quant Scanner & 15-Year Backtester (NSE). Run: streamlit run app.py"""
 import io
-import random
 import time
+import urllib.request
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 
 import numpy as np
 import pandas as pd
-import requests
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Buffett-Greenblatt Hybrid Screener", layout="wide")
-st.title("🏛️ Buffett-Greenblatt Hybrid Stock Screener")
-st.caption("Greenblatt Magic Formula (ROCE + Earnings Yield) + Buffett Safety (Low Debt + Consistent Growth) "
-           "+ Fair Value & Buy/Sell Signal + 10-Year Backtest")
+warnings.filterwarnings("ignore")
+NAN = float("nan")
+RF = 0.06  # liquid-fund / risk-free proxy
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-NSE = "https://archives.nseindia.com/content"
-URLS = {
-    "nifty500": f"{NSE}/indices/ind_nifty500list.csv",
-    "micro250": f"{NSE}/indices/ind_niftymicrocap250_list.csv",
-    "all": f"{NSE}/equities/EQUITY_L.csv",
+BUILTIN = ("RELIANCE TCS HDFCBANK INFY ICICIBANK HINDUNILVR ITC BAJFINANCE ASIANPAINT TITAN PIDILITIND HAVELLS "
+           "NESTLEIND BRITANNIA MARICO DABUR COLPAL PAGEIND BERGEPAINT ABBOTINDIA SUNPHARMA DIVISLAB TATAELXSI "
+           "PERSISTENT COFORGE POLYCAB ASTRAL SUPREMEIND DIXON TRENT CDSL CAMS HDFCAMC MUTHOOTFIN SBILIFE HDFCLIFE "
+           "EICHERMOT HEROMOTOCO MARUTI TVSMOTOR PIIND DEEPAKNTR SRF ATUL SIEMENS ABB CUMMINSIND KEI BLUESTARCO "
+           "VOLTAS IRCTC GODREJCP TATACONSUM VBL RELAXO CRISIL MPHASIS NAUKRI LALPATHLAB ALKEM TORNTPHARM AJANTPHARM "
+           "CIPLA LUPIN KOTAKBANK AXISBANK LT WIPRO HCLTECH TECHM BAJAJ-AUTO DMART INDIAMART").split()
+NSE_URLS = {"Nifty 500 (NSE archive)": "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
+            "Nifty Total Market (NSE archive)": "https://nsearchives.nseindia.com/content/indices/ind_niftytotalmarket_list.csv"}
+
+ALIASES = {
+    "Ticker": ["nse code", "ticker", "symbol", "nse"], "Name": ["name", "company"],
+    "Sector": ["sector", "industry"], "CMP": ["cmp rs.", "cmp", "current price", "price"],
+    "MCap": ["mar cap rs.cr.", "market cap", "mcap", "mar cap"], "ROE": ["roe", "return on equity", "roe %"],
+    "ROCE": ["roce", "return on capital employed", "roce %"],
+    "SalesCAGR": ["sales growth 5years", "sales growth 5 years", "sales cagr 5y", "sales growth 3years"],
+    "ProfitCAGR": ["profit growth 5years", "profit growth 5 years", "profit cagr 5y", "profit growth 3years"],
+    "DE": ["debt to equity", "debt/equity", "d/e"], "PE": ["p/e", "pe", "stock p/e", "price to earning"],
+    "ICR": ["interest coverage ratio", "icr", "int coverage"], "CFO_PAT": ["cfo/pat"],
+    "NPM": ["npm", "net profit margin", "npm %"], "PB": ["pb", "price to book value", "p/b"],
 }
-RISK_FREE = 0.065  # India 10Y approx, Sharpe ke liye
 
 
-# ================================================================== DATA
-def get_symbols(universe, limit):
-    def read(url):
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        return pd.read_csv(io.StringIO(r.text))
+# ----------------------------------------------------------------------------- scoring
+def lin(x, lo, hi):
+    """0..1 linear ramp; missing data gets a neutral 0.5."""
+    if x is None or pd.isna(x):
+        return 0.5
+    return float(np.clip((x - lo) / (hi - lo), 0, 1))
 
-    if universe == "Nifty 500 + Microcap 250 (~750 companies)":
-        d = pd.concat([read(URLS["nifty500"]), read(URLS["micro250"])])
-        syms = d["Symbol"].astype(str).str.strip().unique().tolist()
+
+def score_stock(m):
+    fin = bool(m.get("Fin"))
+    if fin:
+        cap = 0.6 * lin(m.get("ROE"), 8, 15) + 0.4 * lin(m.get("ROA"), 0.8, 1.5)
+        solv = 1 - lin(m.get("PB"), 3, 6)
+        cash = 0.5
     else:
-        d = read(URLS["all"])
-        d.columns = d.columns.str.strip()
-        d = d[d["SERIES"].str.strip() == "EQ"]
-        syms = d["SYMBOL"].astype(str).str.strip().unique().tolist()
-        random.Random(42).shuffle(syms)
-        syms = syms[:limit]
-    return syms
+        dup = 0.6 * lin(m.get("NPM"), 4, 12) + 0.4 * lin(m.get("AssetTurn"), 0.3, 0.8)
+        cap = 0.4 * lin(m.get("ROE"), 8, 15) + 0.4 * lin(m.get("ROCE"), 10, 20) + 0.2 * dup
+        solv = 0.6 * (1 - lin(m.get("DE"), 0.5, 1.5)) + 0.4 * lin(m.get("ICR"), 1, 5)
+        fcf = m.get("FCF")
+        fcf_s = 0.5 if (fcf is None or pd.isna(fcf)) else float(fcf > 0)
+        cash = 0.6 * lin(m.get("CFO_PAT"), 0.3, 0.8) + 0.4 * fcf_s
+    growth = 0.5 * lin(m.get("SalesCAGR"), 4, 12) + 0.5 * lin(m.get("ProfitCAGR"), 5, 15)
+    peg = m.get("PEG")
+    if peg is None or pd.isna(peg) or peg <= 0:
+        garp = 0.2
+    elif peg < 0.5:
+        garp = lin(peg, 0.2, 0.5)
+    elif peg <= 1.5:
+        garp = 1.0
+    else:
+        garp = 1 - lin(peg, 1.5, 3.0)
+    total = 30 * cap + 25 * growth + 20 * cash + 15 * solv + 10 * garp
+    return round(total, 1)
 
 
-def pct(x):
-    return None if x is None or pd.isna(x) else float(x) * 100
-
-
-def fetch_stage1(sym):
-    """Fast data from yfinance .info (with retry)"""
-    i = None
-    for attempt in range(3):
-        try:
-            i = yf.Ticker(sym + ".NS").info
-            if i and (i.get("marketCap") or i.get("currentPrice")):
-                break
-        except Exception:
-            pass
-        i = None
-        time.sleep(0.7 * (attempt + 1))
-    if not i:
-        return None
-    try:
-        de = i.get("debtToEquity")
-        ev, ebitda = i.get("enterpriseValue"), i.get("ebitda")
-        return {
-            "Symbol": sym,
-            "Name": i.get("shortName", sym),
-            "Price": i.get("currentPrice"),
-            "MCap_Cr": (i.get("marketCap") or 0) / 1e7,
-            "PE": i.get("trailingPE"),
-            "ROE": pct(i.get("returnOnEquity")),
-            "DE": None if de is None else de / 100,
-            "Rev_Growth": pct(i.get("revenueGrowth")),
-            "EPS_Growth": pct(i.get("earningsGrowth")),
-            "EV_EBITDA_Yield": (ebitda / ev * 100) if ev and ebitda and ev > 0 else None,
-            "EPS": i.get("trailingEps"),
-            "BVPS": i.get("bookValue"),
-            "FCF": i.get("freeCashflow"),
-            "Shares": i.get("sharesOutstanding"),
-        }
-    except Exception:
-        return None
-
-
+# ----------------------------------------------------------------------------- fundamentals
 def _row(df, names):
+    if df is None or getattr(df, "empty", True):
+        return pd.Series(dtype=float)
     for n in names:
         if n in df.index:
-            return df.loc[n]
-    return None
+            return df.loc[n].dropna().astype(float).sort_index()
+    return pd.Series(dtype=float)
 
 
-def _cagr(series):
-    s = series.dropna()
-    n = len(s) - 1
-    if n >= 2 and s.iloc[0] > 0 and s.iloc[-1] > 0:
-        return ((s.iloc[0] / s.iloc[-1]) ** (1 / n) - 1) * 100
-    return None
+def _cagr(s):
+    s = s[s > 0]
+    if len(s) < 2:
+        return NAN
+    yrs = (s.index[-1] - s.index[0]).days / 365.25
+    return ((s.iloc[-1] / s.iloc[0]) ** (1 / yrs) - 1) * 100 if yrs >= 1 else NAN
 
 
-def _up_years(series):
-    s = series.dropna().iloc[::-1]
-    return int((s.diff().dropna() > 0).sum()), max(len(s) - 1, 0)
+def _last(s):
+    return float(s.iloc[-1]) if len(s) else NAN
 
 
-def fetch_stage2(sym):
-    """Accurate ROCE + multi-year growth from financial statements"""
-    out = {"Symbol": sym, "ROCE": None, "Sales_CAGR": None, "Profit_CAGR": None, "Sales_Up_Years": ""}
-    try:
-        t = yf.Ticker(sym + ".NS")
-        fin, bs = t.financials, t.balance_sheet
-        ebit = _row(fin, ["EBIT", "Operating Income"])
-        ta = _row(bs, ["Total Assets"])
-        cl = _row(bs, ["Current Liabilities", "Total Current Liabilities"])
-        if ebit is not None and ta is not None and cl is not None:
-            cap = ta.iloc[0] - cl.iloc[0]
-            if cap > 0:
-                out["ROCE"] = ebit.iloc[0] / cap * 100
-        rev = _row(fin, ["Total Revenue", "Operating Revenue"])
-        ni = _row(fin, ["Net Income", "Net Income Common Stockholders"])
-        if rev is not None:
-            out["Sales_CAGR"] = _cagr(rev)
-            up, tot = _up_years(rev)
-            out["Sales_Up_Years"] = f"{up}/{tot}"
-        if ni is not None:
-            out["Profit_CAGR"] = _cagr(ni)
-    except Exception:
-        pass
-    return out
+def fetch_one(tk, retries=3):
+    err = ""
+    for i in range(retries):
+        try:
+            t = yf.Ticker(tk)
+            info = t.info or {}
+            if not info or ("currentPrice" not in info and "regularMarketPrice" not in info):
+                raise ValueError("no data")
+            inc, bs, cf = t.income_stmt, t.balance_sheet, t.cashflow
+            rev = _row(inc, ["Total Revenue", "Operating Revenue"])
+            ni = _row(inc, ["Net Income", "Net Income Common Stockholders"])
+            ebit = _row(inc, ["EBIT", "Operating Income"])
+            intr = _row(inc, ["Interest Expense", "Interest Expense Non Operating"])
+            ta = _row(bs, ["Total Assets"])
+            cl = _row(bs, ["Current Liabilities", "Total Current Liabilities"])
+            eq = _row(bs, ["Stockholders Equity", "Common Stock Equity"])
+            cfo = _row(cf, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"])
+            fcfs = _row(cf, ["Free Cash Flow"])
+            sector = info.get("sector", "NA")
+            fin = sector == "Financial Services"
+            pe = info.get("trailingPE", NAN)
+            pcagr = _cagr(ni)
+            de = info.get("debtToEquity", NAN)
+            de = de / 100 if de is not None and not pd.isna(de) else NAN
+            roe = info.get("returnOnEquity")
+            roe = roe * 100 if roe is not None else (_last(ni) / _last(eq) * 100 if len(eq) and len(ni) else NAN)
+            capemp = _last(ta) - _last(cl) if len(ta) and len(cl) else NAN
+            ni_l = _last(ni)
+            return {
+                "Ticker": tk, "Name": info.get("shortName", tk), "Sector": sector,
+                "CMP": info.get("currentPrice", info.get("regularMarketPrice", NAN)),
+                "MCap": (info.get("marketCap") or NAN) / 1e7, "Fin": fin,
+                "ROE": roe, "ROA": (info.get("returnOnAssets") or NAN) * 100,
+                "ROCE": _last(ebit) / capemp * 100 if capemp and capemp > 0 else NAN,
+                "NPM": _last(ni) / _last(rev) * 100 if len(rev) and len(ni) else NAN,
+                "AssetTurn": _last(rev) / _last(ta) if len(rev) and len(ta) else NAN,
+                "SalesCAGR": _cagr(rev), "ProfitCAGR": pcagr, "DE": de,
+                "ICR": abs(_last(ebit) / _last(intr)) if len(intr) and len(ebit) and _last(intr) != 0 else NAN,
+                "CFO_PAT": _last(cfo) / ni_l if len(cfo) and ni_l and ni_l > 0 else NAN,
+                "FCF": _last(fcfs) if len(fcfs) else info.get("freeCashflow", NAN),
+                "PE": pe, "PB": info.get("priceToBook", NAN),
+                "PEG": pe / pcagr if pe and not pd.isna(pe) and pcagr and pcagr > 0 else NAN,
+            }
+        except Exception as e:  # rate limit / missing data
+            err = str(e)[:80]
+            time.sleep(1.5 ** (i + 1))
+    return {"Ticker": tk, "error": err or "failed"}
 
 
-def run_parallel(fn, items, label, workers=8):
-    results, bar = [], st.progress(0.0, text=label)
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(fn, s) for s in items]
-        for k, f in enumerate(as_completed(futs), 1):
-            r = f.result()
-            if r:
-                results.append(r)
-            bar.progress(k / len(items), text=f"{label} ({k}/{len(items)})")
+def run_scan(tickers):
+    cache = st.session_state.setdefault("fcache", {})
+    todo = [t for t in tickers if t not in cache]
+    bar, txt = st.progress(0.0), st.empty()
+    done = 0
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        futs = {ex.submit(fetch_one, t): t for t in todo}
+        for f in as_completed(futs):
+            cache[futs[f]] = f.result()
+            done += 1
+            bar.progress(done / max(len(todo), 1))
+            txt.caption(f"Fetched {done}/{len(todo)} (cached: {len(tickers) - len(todo)})")
     bar.empty()
-    return results
+    txt.empty()
+    rows = [cache[t] for t in tickers if t in cache]
+    good = [r for r in rows if "error" not in r]
+    return pd.DataFrame(good), len(rows) - len(good)
 
 
-def rank_score(df, use_growth=True, roce_col="ROCE"):
+def parse_screener(df):
+    cols = {c.strip().lower(): c for c in df.columns}
+    out = pd.DataFrame(index=df.index)
+    for key, names in ALIASES.items():
+        src = next((cols[n] for n in names if n in cols), None)
+        out[key] = pd.to_numeric(df[src], errors="coerce") if src and key not in ("Ticker", "Name", "Sector") \
+            else (df[src] if src else (NAN if key not in ("Ticker", "Name", "Sector") else ""))
+    if "Ticker" not in out or (out["Ticker"] == "").all():
+        raise ValueError("CSV needs an 'NSE Code' / 'Ticker' / 'Symbol' column")
+    out["Ticker"] = out["Ticker"].astype(str).str.strip().str.upper().str.replace(".NS", "", regex=False) + ".NS"
+    out["Name"] = out["Name"].where(out["Name"] != "", out["Ticker"])
+    out["Sector"] = out["Sector"].replace("", "NA")
+    out["CFO_PAT"] = out["CFO_PAT"].apply(lambda v: v / 100 if pd.notna(v) and v > 5 else v)
+    out["Fin"] = out["Sector"].astype(str).str.contains("Bank|Financ|NBFC|Insur", case=False)
+    out["PEG"] = out["PE"] / out["ProfitCAGR"].where(out["ProfitCAGR"] > 0)
+    out["ROA"] = NAN
+    out["AssetTurn"] = NAN
+    out["FCF"] = NAN
+    return out[out["Ticker"] != "NAN.NS"].drop_duplicates("Ticker")
+
+
+def csv_template():
+    return pd.DataFrame([{"Name": "Pidilite Industries", "NSE Code": "PIDILITIND", "Sector": "Chemicals",
+                          "CMP Rs.": 2900, "Mar Cap Rs.Cr.": 147000, "ROE": 23.0, "ROCE": 30.0,
+                          "Sales growth 5Years": 14.0, "Profit growth 5Years": 18.0, "Debt to equity": 0.05,
+                          "P/E": 75.0, "Interest Coverage Ratio": 40.0, "CFO/PAT": 0.95, "NPM": 15.0, "PB": 15.0}])
+
+
+# ----------------------------------------------------------------------------- technicals
+def rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+
+def add_ind(df):
     df = df.copy()
-    df["Earnings_Yield"] = 100 / df["PE"]
-    df["R_ROCE"] = df[roce_col].rank(ascending=False)
-    df["R_EY"] = df["Earnings_Yield"].rank(ascending=False)
-    df["Score"] = df["R_ROCE"] + df["R_EY"]
-    if use_growth and "Profit_CAGR" in df and df["Profit_CAGR"].notna().any():
-        df["R_Growth"] = df["Profit_CAGR"].rank(ascending=False)
-        df["Score"] += df["R_Growth"]
-    return df.sort_values("Score")
+    c = df["Close"]
+    df["EMA50"], df["EMA200"] = c.ewm(span=50, adjust=False).mean(), c.ewm(span=200, adjust=False).mean()
+    df["SMA50"], df["SMA200"] = c.rolling(50).mean(), c.rolling(200).mean()
+    df["RSI"] = rsi(c)
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    df["MACD"], df["MSIG"] = macd, macd.ewm(span=9, adjust=False).mean()
+    df["MHIST"] = df["MACD"] - df["MSIG"]
+    mid, sd = c.rolling(20).mean(), c.rolling(20).std()
+    df["BBU"], df["BBL"] = mid + 2 * sd, mid - 2 * sd
+    df["VOLX"] = df["Volume"] / df["Volume"].rolling(20).mean()
+    w = c.resample("W-FRI").last()
+    df["RSIW"] = rsi(w).reindex(df.index, method="ffill")
+    df["SMA20W"] = w.rolling(20).mean().reindex(df.index, method="ffill")
+    wk_dma = df["SMA200"].resample("W-FRI").last()
+    df["WKBELOW"] = (w < 0.97 * wk_dma).reindex(df.index, method="ffill").fillna(False).astype(bool)
+    return df
 
 
-# ================================================================== VALUATION
-def _num(x):
+def tech_series(df, score, peg):
+    """Vectorised technical-only conditions (fundamentals held at current values) for chart markers."""
+    c = df["Close"]
+    near = ((c / df["SMA50"] - 1).abs() <= 0.05) | ((c / df["SMA20W"] - 1).abs() <= 0.05)
+    buy = (score >= 75) & (c > df["SMA200"]) & near & df["RSI"].between(40, 58) & (not pd.isna(peg) and peg <= 1.35)
+    sell = df["WKBELOW"] & (df["SMA50"] < df["SMA200"]) & (df["RSI"] < 40)
+    macd_bear = (df["MHIST"] < 0) & (df["MHIST"].rolling(6).max() > 0)
+    trim = ((df["RSI"] > 78) & macd_bear) | ((c > 1.25 * df["SMA200"]) & (df["RSI"] > 70))
+    return buy, trim, sell
+
+
+def signal_for(df, m):
+    r, reasons = df.iloc[-1], []
+    score, peg, fin = m.get("Score", 0), m.get("PEG", NAN), bool(m.get("Fin"))
+    # Hard sell: fundamental breakdown
+    if fin:
+        if pd.notna(m.get("ROE")) and m["ROE"] < 10:
+            reasons.append("ROE < 10%")
+    else:
+        if pd.notna(m.get("ROCE")) and m["ROCE"] < 15:
+            reasons.append("ROCE < 15%")
+        if pd.notna(m.get("DE")) and m["DE"] > 1.0:
+            reasons.append("D/E > 1.0")
+        if pd.notna(m.get("CFO_PAT")) and m["CFO_PAT"] < 0.6:
+            reasons.append("CFO/PAT < 0.60")
+    if r["WKBELOW"] and r["SMA50"] < r["SMA200"] and r["RSI"] < 40:
+        reasons.append("Weekly close >3% below 200-DMA + Death Cross + RSI<40")
+    if reasons:
+        return "🔴 HARD SELL", reasons
+    c = r["Close"]
+    macd_bear = r["MHIST"] < 0 and df["MHIST"].iloc[-6:].max() > 0
+    if (pd.notna(peg) and peg > 2.2) or (r["RSI"] > 78 and macd_bear) or (c > 1.25 * r["SMA200"] and r["RSI"] > 70):
+        return "🟡 TRIM 25-30%", ["PEG > 2.2 / overheated RSI+MACD / >25% above 200-DMA"]
+    near = abs(c / r["SMA50"] - 1) <= 0.05 or abs(c / r["SMA20W"] - 1) <= 0.05
+    if score >= 75 and c > r["SMA200"] and near and 40 <= r["RSI"] <= 58 and pd.notna(peg) and peg <= 1.35:
+        return "🟢 STRONG BUY", ["Quality + uptrend + pullback to support + RSI 40-58 + PEG<=1.35"]
+    if score >= 75 and c > r["SMA50"] and 58 < r["RSI"] <= 70 and pd.notna(peg) and 1.35 < peg <= 1.75:
+        return "🔵 ACCUMULATE", ["Quality + above 50-DMA + RSI 58-70 + PEG 1.35-1.75"]
+    return "⚪ HOLD / WATCH", ["No trigger"]
+
+
+def get_hist(tk, period="3y"):
+    cache = st.session_state.setdefault("hcache", {})
+    key = (tk, period)
+    if key not in cache:
+        d = yf.Ticker(tk).history(period=period, auto_adjust=True)
+        if d.empty:
+            return None
+        d.index = d.index.tz_localize(None) if d.index.tz is not None else d.index
+        cache[key] = add_ind(d)
+    return cache[key]
+
+
+def hist_pe_median(tk, cur_pe):
     try:
-        x = float(x)
-        return None if np.isnan(x) else x
-    except (TypeError, ValueError):
-        return None
+        t = yf.Ticker(tk)
+        eps = _row(t.income_stmt, ["Diluted EPS", "Basic EPS"])
+        px = t.history(period="6y", auto_adjust=False)["Close"]
+        px.index = px.index.tz_localize(None)
+        pes = []
+        for d, e in eps.items():
+            if e > 0:
+                pes.append(px[:d].iloc[-1] / e)
+        return float(np.median(pes)) if pes else NAN
+    except Exception:
+        return NAN
 
 
-def dcf_per_share(fcf, shares, growth_pct, disc=0.12, term=0.05, years=10):
-    """Conservative 10-yr DCF: growth 5 saal tak g1 (max 15%), phir 6% tak fade, terminal 5%."""
-    fcf, shares = _num(fcf), _num(shares)
-    if not fcf or not shares or fcf <= 0 or shares <= 0:
-        return None
-    g1 = min(max(growth_pct, 0), 15) / 100
-    cf, pv = fcf, 0.0
-    for t in range(1, years + 1):
-        g = g1 if t <= 5 else g1 + (0.06 - g1) * (t - 5) / (years - 5)
-        cf *= 1 + g
-        pv += cf / (1 + disc) ** t
-    pv += (cf * (1 + term) / (disc - term)) / (1 + disc) ** years
-    return pv / shares
+# ----------------------------------------------------------------------------- backtest
+def fetch_prices(tickers, start):
+    raw = yf.download(tickers + ["^NSEI"], start=start, end=date.today().isoformat(), auto_adjust=True,
+                      progress=False, threads=True)
+    px = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+    px.index = px.index.tz_localize(None) if px.index.tz is not None else px.index
+    px = px.dropna(axis=1, how="all")
+    return px.drop(columns=["^NSEI"]), px["^NSEI"].dropna()
 
 
-def fair_values(r):
-    """3 models: Graham Number, Lynch PEG, DCF. Fair value = median of available."""
-    eps, bvps = _num(r.get("EPS")), _num(r.get("BVPS"))
-    g = _num(r.get("Profit_CAGR"))
-    if g is None:
-        g = _num(r.get("EPS_Growth"))
-    if g is None:
-        g = 10.0
-    out = {"Graham": None, "Lynch_PEG": None, "DCF": None}
-    if eps and bvps and eps > 0 and bvps > 0:
-        out["Graham"] = (22.5 * eps * bvps) ** 0.5
-    if eps and eps > 0:
-        out["Lynch_PEG"] = eps * min(max(g, 8), 25)  # PEG=1, fair P/E 8..25 ke beech
-    out["DCF"] = dcf_per_share(r.get("FCF"), r.get("Shares"), g)
-    vals = [v for v in out.values() if v]
-    out["Fair_Value"] = float(np.median(vals)) if vals else None
-    out["Models_Used"] = len(vals)
-    return out
+def backtest(prices, bench, capital, sip, freq, trend, cost=0.0025):
+    idx = bench.index
+    prices = prices.reindex(idx)
+    av = prices.notna().values
+    rets = prices.pct_change(fill_method=None).fillna(0).values
+    n, T = prices.shape[1], len(idx)
+    if trend:
+        sma = prices.rolling(200, min_periods=200).mean()
+        sig = (prices > sma).astype(float).where(sma.notna())
+        ip = sig.resample("W-FRI").last().reindex(idx, method="ffill").shift(1).fillna(1).values > 0.5
+    else:
+        ip = np.ones((T, n), dtype=bool)
+    yr, mo = idx.year.values, idx.month.values
+    key = {"Annual": yr, "Semi-Annual": yr * 2 + (mo > 6), "Buy-and-Hold": np.zeros(T)}[freq]
+    rebal = np.r_[False, key[1:] != key[:-1]] if freq != "Buy-and-Hold" else np.zeros(T, bool)
+    sipday = np.r_[False, mo[1:] != mo[:-1]] if sip > 0 else np.zeros(T, bool)
+    cr = RF / 252
+    vals, cash, inv, prev_post = np.zeros(n), float(capital), float(capital), capital
+    tw, eq, invested = np.ones(T), np.zeros(T), np.zeros(T)
+    for t in range(T):
+        act = av[t]
+        if t > 0:
+            vals = vals * (1 + np.where(ip[t], rets[t], cr))
+            cash *= 1 + cr
+            tog = (ip[t] != ip[t - 1]) & act
+            vals = vals - vals * tog * cost
+            tw[t] = (vals.sum() + cash) / prev_post
+            if sipday[t]:
+                cash += sip
+                inv += sip
+        total = vals.sum() + cash
+        if act.any() and (t == 0 or rebal[t]):
+            tgt = np.where(act, total / act.sum(), 0.0)
+            fee = cost * np.abs(tgt - vals).sum()
+            vals, cash = tgt * (1 - fee / total), 0.0
+        elif act.any() and cash > 1e-9:
+            vals = vals + np.where(act, cash / act.sum(), 0.0) * (1 - cost)
+            cash = 0.0
+        prev_post = vals.sum() + cash
+        eq[t], invested[t] = prev_post, inv
+    b = bench.values
+    units, beq = capital * (1 - cost) / b[0], np.zeros(T)
+    for t in range(T):
+        if t > 0 and sipday[t]:
+            units += sip * (1 - cost) / b[t]
+        beq[t] = units * b[t]
+    btw = np.r_[1.0, b[1:] / b[:-1]]
+    return {"idx": idx, "s_curve": pd.Series(np.cumprod(tw), idx), "b_curve": pd.Series(np.cumprod(btw), idx),
+            "s_val": eq[-1], "b_val": beq[-1], "invested": invested[-1]}
 
 
-def get_signal(price, fv, roce, de, pcagr):
-    price, fv = _num(price), _num(fv)
-    roce, de, pcagr = _num(roce), _num(de), _num(pcagr)
-    breaks = []
-    if roce is not None and roce < 12: breaks.append("ROCE < 12%")
-    if de is not None and de > 1: breaks.append("Debt/Equity > 1")
-    if pcagr is not None and pcagr < 0: breaks.append("Profit CAGR negative")
-    if not price or not fv:
-        return "⚪ NO DATA", "Fair value nikalne layak data nahi"
-    ratio = price / fv
-    if breaks:
-        return "🔴 SELL / REVIEW", "Quality toot rahi hai: " + ", ".join(breaks)
-    if ratio > 1.3:
-        return "🔴 SELL / TRIM", f"Price fair value se {100*(ratio-1):.0f}% upar"
-    if ratio > 1.1:
-        return "🟠 OVERVALUED", "Naya mat khareedo, hold karein"
-    if ratio > 0.85:
-        return "🟡 HOLD / FAIR", "Fair value ke aas-paas"
-    if ratio > 0.7:
-        return "🟢 BUY", f"Fair value se {100*(1-ratio):.0f}% neeche"
-    return "🟢 STRONG BUY", f"Fair value se {100*(1-ratio):.0f}% neeche (margin of safety)"
-
-
-def add_valuation(df):
-    df = df.copy()
-    rows = []
-    for _, r in df.iterrows():
-        v = fair_values(r)
-        sig, why = get_signal(r.get("Price"), v["Fair_Value"], r.get("ROCE"), r.get("DE"), r.get("Profit_CAGR"))
-        fv, p = v["Fair_Value"], _num(r.get("Price"))
-        rows.append({
-            "Graham": v["Graham"], "Lynch_PEG": v["Lynch_PEG"], "DCF": v["DCF"],
-            "Fair_Value": fv,
-            "Upside_%": ((fv / p - 1) * 100) if fv and p else None,
-            "Signal": sig, "Reason": why,
-        })
-    return pd.concat([df.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
-
-
-# ================================================================== BACKTEST
-def rebalance_curve(prices):
-    """Equal-weight, har calendar year ke start par rebalance. prices: DataFrame (date x stock)."""
-    ret = prices.pct_change().iloc[1:]
-    pieces, value = [], 1.0
-    for _, ch in ret.groupby(ret.index.year):
-        valid = ch.columns[ch.iloc[0].notna()]
-        if len(valid) == 0:
-            continue
-        cum = (1 + ch[valid].fillna(0)).cumprod().mean(axis=1) * value
-        pieces.append(cum)
-        value = cum.iloc[-1]
-    return pd.concat(pieces) if pieces else pd.Series(dtype=float)
-
-
-def perf_metrics(curve):
-    curve = curve.dropna()
-    curve = curve / curve.iloc[0]
+def metrics(curve):
+    rr = curve.pct_change().dropna()
     yrs = (curve.index[-1] - curve.index[0]).days / 365.25
     cagr = curve.iloc[-1] ** (1 / yrs) - 1
-    dd = (curve / curve.cummax() - 1).min()
-    vol = curve.pct_change().dropna().std() * np.sqrt(252)
-    sharpe = (cagr - RISK_FREE) / vol if vol > 0 else np.nan
-    return {"CAGR %": cagr * 100, "Max Drawdown %": dd * 100, "Volatility %": vol * 100,
-            "Sharpe": sharpe, "Total Return %": (curve.iloc[-1] - 1) * 100}
+    dd = curve / curve.cummax() - 1
+    ex = rr - RF / 252
+    down = rr[rr < RF / 252] - RF / 252
+    sharpe = ex.mean() / rr.std() * np.sqrt(252) if rr.std() > 0 else NAN
+    sortino = ex.mean() / np.sqrt((down ** 2).mean()) * np.sqrt(252) if len(down) else NAN
+    mdd = dd.min()
+    return {"CAGR": cagr, "MDD": mdd, "Sharpe": sharpe, "Sortino": sortino, "Calmar": cagr / abs(mdd) if mdd else NAN,
+            "dd": dd}
 
 
-def yearly_returns(curve):
-    curve = curve.dropna()
-    ye = curve.groupby(curve.index.year).last()
-    yr = ye.pct_change()
-    yr.iloc[0] = ye.iloc[0] / curve.iloc[0] - 1
-    return yr * 100
+def yearly(curve):
+    y = curve.groupby(curve.index.year).last()
+    return (y / y.shift(1).fillna(1.0) - 1) * 100
 
 
-def run_backtest(symbols, years=10):
-    """Returns (both_curves, stock_prices). both = Portfolio vs Nifty 50 (equal-weight, yearly rebalance)."""
-    tickers = [s + ".NS" for s in symbols]
-    data = yf.download(tickers + ["^NSEI"], period=f"{years}y", auto_adjust=True,
-                       progress=False, threads=True)["Close"]
-    data = data.dropna(axis=1, how="all").ffill()
-    if "^NSEI" not in data.columns:
-        raise ValueError("Nifty 50 ka data nahi mila")
-    stocks = data.drop(columns=["^NSEI"])
-    if stocks.shape[1] == 0:
-        raise ValueError("Kisi bhi stock ka price data nahi mila. Symbols check karein.")
-    bench = (1 + data["^NSEI"].pct_change().iloc[1:]).cumprod()
-    port = rebalance_curve(stocks)
-    both = pd.concat([port.rename("Portfolio"), bench.rename("Nifty 50")], axis=1).dropna()
-    both = both / both.iloc[0]
-    return both, stocks
+# ----------------------------------------------------------------------------- UI
+def fig_style(fig, h=420):
+    fig.update_layout(template="plotly_dark", height=h, margin=dict(l=10, r=10, t=40, b=10),
+                      paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", legend=dict(orientation="h", y=1.08))
+    return fig
 
 
-def stock_cagrs(stocks):
-    rows = []
-    for c in stocks.columns:
-        s_ = stocks[c].dropna()
-        if len(s_) < 120:
-            continue
-        yrs = (s_.index[-1] - s_.index[0]).days / 365.25
-        rows.append({"Symbol": str(c).replace(".NS", ""), "Data (saal)": round(yrs, 1),
-                     "CAGR %": round(((s_.iloc[-1] / s_.iloc[0]) ** (1 / yrs) - 1) * 100, 1)})
-    return pd.DataFrame(rows).sort_values("CAGR %", ascending=False) if rows else pd.DataFrame()
-
-
-def show_backtest(both, stocks, label="Portfolio"):
-    both = both.rename(columns={"Portfolio": label})
-    pm, nm = perf_metrics(both[label]), perf_metrics(both["Nifty 50"])
-    c1, c2, c3 = st.columns(3)
-    c1.metric(f"{label} CAGR", f"{pm['CAGR %']:.1f}%")
-    c2.metric("Nifty 50 CAGR", f"{nm['CAGR %']:.1f}%")
-    c3.metric("Fark (Alpha)", f"{pm['CAGR %'] - nm['CAGR %']:+.1f}%")
-    st.line_chart(both)
-    st.dataframe(pd.DataFrame({label: pm, "Nifty 50": nm}).round(2), use_container_width=True)
-    yr = pd.DataFrame({f"{label} %": yearly_returns(both[label]),
-                       "Nifty 50 %": yearly_returns(both["Nifty 50"])}).round(1)
-    st.write("Saal-dar-saal return:")
-    st.dataframe(yr.T, use_container_width=True)
-    if stocks.shape[1] > 1:
-        st.write("Har stock ka alag CAGR (data shuru hone se aaj tak):")
-        st.dataframe(stock_cagrs(stocks), use_container_width=True, hide_index=True)
-    st.caption(f"{stocks.shape[1]} stock(s), equal-weight, har saal rebalance. Jin stocks ki history poori nahi, "
-               "wo listing ke baad se judte hain. Brokerage/tax/slippage shamil nahi. "
-               "⚠️ Aaj ke chune stocks par purana test hai (look-ahead bias), isliye result zyada achha dikh sakta hai.")
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def nse_name_map():
-    r = requests.get(URLS["all"], headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    d = pd.read_csv(io.StringIO(r.text))
-    d.columns = d.columns.str.strip()
-    return dict(zip(d["NAME OF COMPANY"].astype(str).str.lower(), d["SYMBOL"].astype(str)))
-
-
-def _norm(n):
-    n = n.lower().replace(".", " ").replace("&", " and ")
-    for w in (" limited", " ltd", " ind ", " india"):
-        n = n.replace(w, " ")
-    return " ".join(n.split())
-
-
-def match_by_name(name, name_map):
-    """Screener ke chhote naam ko NSE ki list se fuzzy match karo."""
-    q = _norm(name)
-    best, best_sym = 0.0, ""
-    for full, sym in name_map.items():
-        f = _norm(full)
-        score = difflib.SequenceMatcher(None, q, f[:len(q) + 3]).ratio()
-        if score > best:
-            best, best_sym = score, sym
-    return best_sym if best >= 0.75 else ""
-
-
-def guess_ticker(name, name_map=None):
-    try:  # 1) Yahoo search
-        for q in yf.Search(name, max_results=8).quotes:
-            sym = q.get("symbol", "")
-            if sym.endswith(".NS"):
-                return sym[:-3]
-    except Exception:
-        pass
-    if name_map:  # 2) NSE list se fuzzy match
-        return match_by_name(name, name_map)
-    return ""
-
-
-# ================================================================== SIDEBAR
-st.sidebar.header("⚙️ Strategy Settings")
-roce_min = st.sidebar.slider("Min ROCE (%)", 10, 40, 20)
-de_max = st.sidebar.slider("Max Debt/Equity", 0.0, 1.5, 0.5, 0.1)
-pe_max = st.sidebar.slider("Max P/E", 10, 80, 35)
-growth_min = st.sidebar.slider("Min Sales & Profit CAGR (%)", 0, 25, 10)
-mcap_min = st.sidebar.number_input("Min Market Cap (₹ Crore)", value=500, step=100)
-top_n = st.sidebar.slider("Kitne top stocks dikhane hain", 5, 30, 15)
-
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🚀 Auto Scan", "🔎 Stock Checker (Buy/Sell)", "📁 CSV Upload", "📚 Philosophy & Limits"])
-
-# ================================================================== TAB 1
-with tab1:
-    c1, c2 = st.columns([2, 1])
-    universe = c1.selectbox(
-        "Kaunsi companies scan karni hain?",
-        ["Nifty 500 + Microcap 250 (~750 companies)", "All NSE listed (random sample)"],
-    )
-    limit = c2.number_input("All NSE mode me kitni companies", 200, 2500, 1000, 100)
-
-    if st.button("🚀 SCAN START - Top Stocks Dhundo", type="primary", use_container_width=True):
-        for k in ("result", "all", "bt"):
-            st.session_state.pop(k, None)
-        try:
-            with st.spinner("NSE se company list la raha hoon..."):
-                symbols = get_symbols(universe, int(limit))
-            st.info(f"{len(symbols)} companies mili. Scan shuru (5-10 minute lag sakte hain)...")
-        except Exception as e:
-            st.error(f"NSE list download nahi hui: {e}. Tab 3 me CSV upload use karein.")
-            st.stop()
-
-        raw = run_parallel(fetch_stage1, symbols, "Stage 1: Basic data", workers=8)
-        st.write(f"Yahoo se data mila: **{len(raw)} / {len(symbols)}** companies")
-        if len(raw) < 0.3 * len(symbols):
-            st.error("Yahoo Finance ne zyada tar companies ka data nahi diya (rate-limit/block). "
-                     "10-15 min baad try karein, app laptop par chalayein, ya Tab 3 me CSV upload karein.")
-            st.stop()
-        s1 = pd.DataFrame(raw)
-        for c in ["MCap_Cr", "PE", "ROE", "DE", "Rev_Growth", "EPS_Growth", "EPS", "BVPS", "FCF", "Shares"]:
-            s1[c] = pd.to_numeric(s1[c], errors="coerce")
-
-        pre = s1[
-            (s1["MCap_Cr"] >= mcap_min)
-            & (s1["PE"] > 0) & (s1["PE"] < pe_max)
-            & (s1["ROE"] >= roce_min * 0.6)
-            & (s1["DE"].fillna(0) <= de_max)
-        ].copy()
-        st.write(f"Stage 1 ke baad **{len(pre)}** companies bachi.")
-        if len(pre) == 0:
-            st.warning("Stage 1 filters ne sab hata diye. Sidebar me ROCE/P/E/Debt dheela karke try karein.")
-            st.stop()
-
-        pre["Earnings_Yield"] = 100 / pre["PE"]
-        pre["q"] = pre["ROE"].rank(ascending=False) + pre["Earnings_Yield"].rank(ascending=False)
-        shortlist = pre.sort_values("q").head(80)
-
-        s2 = pd.DataFrame(run_parallel(fetch_stage2, shortlist["Symbol"].tolist(), "Stage 2: ROCE & growth check"))
-        merged = shortlist.merge(s2, on="Symbol")
-        final = merged[
-            (merged["ROCE"] >= roce_min)
-            & (merged["Sales_CAGR"] >= growth_min)
-            & (merged["Profit_CAGR"] >= growth_min)
-        ]
-        if len(final):
-            st.session_state["result"] = add_valuation(rank_score(final).head(top_n))
+def tab_scanner(sb):
+    st.subheader("Top 15 Coffee Can + GARP Scanner")
+    if st.button("🚀 Run Scan", type="primary"):
+        t0 = time.time()
+        if sb["mode"] == "Screener.in CSV":
+            if sb["file"] is None:
+                st.error("Upload a Screener.in CSV in the sidebar first.")
+                return
+            df = parse_screener(pd.read_csv(sb["file"]))
+            errs = 0
         else:
-            st.session_state["result"] = final
-        st.session_state["all"] = s1
+            tickers = sb["tickers"][:sb["limit"]]
+            if not tickers:
+                st.error("Ticker universe is empty.")
+                return
+            df, errs = run_scan(tickers)
+        if df.empty:
+            st.error("No usable data returned (possibly rate-limited). Try fewer tickers or the Screener CSV mode.")
+            return
+        if not sb["fin"]:
+            df = df[~df["Fin"].astype(bool)]
+        df["Score"] = df.apply(lambda r: score_stock(r.to_dict()), axis=1)
+        df = df[df["Score"] >= sb["min_score"]].sort_values("Score", ascending=False).reset_index(drop=True)
+        top = df.head(15).copy()
+        sigs, why = [], []
+        with st.spinner("Computing technical signals for Top 15..."):
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                hist = dict(zip(top["Ticker"], ex.map(lambda t: _safe_hist(t), top["Ticker"])))
+            for _, r in top.iterrows():
+                h = hist.get(r["Ticker"])
+                if h is None:
+                    sigs.append("n/a")
+                    why.append("no price data")
+                else:
+                    st.session_state.setdefault("hcache", {})[(r["Ticker"], "3y")] = h
+                    s, w = signal_for(h, r.to_dict())
+                    sigs.append(s)
+                    why.append("; ".join(w))
+        top["Signal"], top["Why"] = sigs, why
+        st.session_state["scan"], st.session_state["top"] = df, top
+        st.success(f"Scanned {len(df)} qualifying stocks in {time.time() - t0:.1f}s ({errs} failed fetches).")
+    top = st.session_state.get("top")
+    if top is None:
+        st.info("Pick a universe in the sidebar and press **Run Scan**.")
+        return
+    show = top[["Ticker", "Sector", "CMP", "MCap", "ROE", "ROCE", "SalesCAGR", "ProfitCAGR", "DE", "CFO_PAT",
+                "PE", "PEG", "Score", "Signal"]].copy()
+    show["CFO_PAT"] = show["CFO_PAT"] * 100
+    st.dataframe(show, use_container_width=True, hide_index=True, column_config={
+        "CMP": st.column_config.NumberColumn("CMP ₹", format="%.1f"),
+        "MCap": st.column_config.NumberColumn("Mkt Cap ₹Cr", format="%.0f"),
+        "ROE": st.column_config.NumberColumn("ROE %", format="%.1f"),
+        "ROCE": st.column_config.NumberColumn("ROCE %", format="%.1f"),
+        "SalesCAGR": st.column_config.NumberColumn("Sales CAGR %", format="%.1f"),
+        "ProfitCAGR": st.column_config.NumberColumn("Profit CAGR %", format="%.1f"),
+        "DE": st.column_config.NumberColumn("D/E", format="%.2f"),
+        "CFO_PAT": st.column_config.NumberColumn("CFO/PAT %", format="%.0f"),
+        "PE": st.column_config.NumberColumn("P/E", format="%.1f"),
+        "PEG": st.column_config.NumberColumn("PEG", format="%.2f"),
+        "Score": st.column_config.ProgressColumn("Score /100", min_value=0, max_value=100, format="%.1f")})
+    with st.expander("Signal reasons"):
+        st.dataframe(top[["Ticker", "Signal", "Why"]], hide_index=True, use_container_width=True)
+    st.download_button("Download full ranked universe (CSV)", st.session_state["scan"].to_csv(index=False),
+                       "ranked_universe.csv")
 
-    if "result" in st.session_state:
-        res = st.session_state["result"]
-        if len(res) == 0:
-            st.warning("Koi stock sab filters pass nahi kar paya. Sidebar me ROCE ya growth thoda kam karein.")
-        else:
-            only_cheap = st.checkbox("Sirf Fair Value se sasta (BUY / STRONG BUY) wale dikhao")
-            view = res[res["Signal"].str.contains("BUY")] if only_cheap else res
-            st.subheader(f"🏆 Top {len(view)} Buffett-Greenblatt Stocks")
-            cols = ["Symbol", "Name", "Price", "Fair_Value", "Upside_%", "Signal", "PE", "Earnings_Yield",
-                    "ROCE", "DE", "Sales_CAGR", "Profit_CAGR", "Sales_Up_Years", "MCap_Cr", "Reason"]
-            show = view[cols].round(2).reset_index(drop=True)
-            show.index += 1
-            try:
-                st.dataframe(show.style.background_gradient(subset=["ROCE"], cmap="Greens"),
-                             use_container_width=True)
-            except Exception:  # matplotlib na ho to bina colour ke dikhao
-                st.dataframe(show, use_container_width=True)
-            st.download_button("⬇️ CSV download", show.to_csv().encode(), "top_stocks.csv")
-            with st.expander("Fair value ke 3 models (Graham / Lynch PEG / DCF)"):
-                st.dataframe(res[["Symbol", "Price", "Graham", "Lynch_PEG", "DCF", "Fair_Value"]].round(1),
-                             use_container_width=True)
 
-            st.divider()
-            st.subheader("📈 10 Saal Backtest")
-            st.warning("⚠️ Yeh test **aaj ke chune hue stocks** ko pichle 10 saal par chalata hai. "
-                       "Aaj ke winners pehle se pata hone ki wajah se result **zyada achha dikhega** "
-                       "(look-ahead bias). Ise 'strategy pakki jeetegi' ka saboot na samjhein. "
-                       "Details 'Philosophy & Limits' tab me.")
-            if st.button("📈 10 Saal Backtest Chalao"):
-                with st.spinner("10 saal ka price data la raha hoon..."):
-                    try:
-                        st.session_state["bt"] = run_backtest(res["Symbol"].tolist(), 10)
-                    except Exception as e:
-                        st.error(f"Backtest fail: {e}")
-            if "bt" in st.session_state:
-                show_backtest(*st.session_state["bt"])
-
-        with st.expander("Poora scanned data dekhein"):
-            st.dataframe(st.session_state["all"], use_container_width=True)
-
-# ================================================================== TAB 2
-with tab2:
-    st.write("Apna koi bhi NSE stock daalein (jaise `TCS`, `ITC`, `ASIANPAINT`). Fair value, signal, "
-             "sell-triggers aur 15 saal ka backtest dekhein.")
-    sym = st.text_input("NSE Symbol", value="").strip().upper()
-
-    if st.button("🔎 Check Karo") and sym:
-        with st.spinner("Data la raha hoon..."):
-            a_ = fetch_stage1(sym)
-            b_ = fetch_stage2(sym)
-        if not a_:
-            st.session_state.pop("chk", None)
-            st.error("Data nahi mila. Symbol check karein ya thodi der baad try karein.")
-        else:
-            r_ = {**a_, **b_}
-            v_ = fair_values(r_)
-            sg_, why_ = get_signal(r_["Price"], v_["Fair_Value"], r_["ROCE"], r_["DE"], r_["Profit_CAGR"])
-            st.session_state["chk"] = (sym, r_, v_, sg_, why_)
-
-    if "chk" in st.session_state:
-        csym, r, v, sig, why = st.session_state["chk"]
-        st.subheader(f"{r['Name']} ({csym})")
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Current Price", f"₹{r['Price']:.1f}" if r["Price"] else "NA")
-        k2.metric("Fair Value", f"₹{v['Fair_Value']:.1f}" if v["Fair_Value"] else "NA")
-        if v["Fair_Value"] and r["Price"]:
-            k3.metric("Upside / (Downside)", f"{(v['Fair_Value']/r['Price']-1)*100:.0f}%")
-        k4.metric("Signal", sig)
-        st.info(why)
-
-        st.write("**Fair value models**")
-        st.dataframe(pd.DataFrame([{k: (round(x, 1) if x else None) for k, x in v.items()
-                                     if k in ("Graham", "Lynch_PEG", "DCF", "Fair_Value")}]),
-                     use_container_width=True)
-
-        st.write("**Sell-trigger checklist**")
-        def chk(ok, text): st.write(("✅ " if ok else "❌ ") + text)
-        def rnd(x, n=1):
-            x = _num(x)
-            return "NA" if x is None else round(x, n)
-        chk(_num(r["ROCE"]) is not None and r["ROCE"] >= 15, f"ROCE >= 15%  (abhi: {rnd(r['ROCE'])}%)")
-        chk(_num(r["DE"]) is not None and r["DE"] <= 0.5, f"Debt/Equity <= 0.5  (abhi: {rnd(r['DE'], 2)})")
-        chk(_num(r["Profit_CAGR"]) is not None and r["Profit_CAGR"] >= 10, f"Profit CAGR >= 10%  (abhi: {rnd(r['Profit_CAGR'])}%)")
-        chk(_num(r["Sales_CAGR"]) is not None and r["Sales_CAGR"] >= 10, f"Sales CAGR >= 10%  (abhi: {rnd(r['Sales_CAGR'])}%)")
-        chk(_num(r["PE"]) is not None and 0 < r["PE"] < 40, f"P/E < 40  (abhi: {rnd(r['PE'])})")
-
-        try:
-            h = yf.Ticker(csym + ".NS").history(period="2y")["Close"]
-            chart = pd.DataFrame({"Price": h, "200-DMA": h.rolling(200).mean()}).dropna()
-            st.write("**Price vs 200-DMA** (sirf trend ka reference, sell rule nahi)")
-            st.line_chart(chart)
-        except Exception:
-            pass
-
-        st.divider()
-        st.subheader(f"📈 15 Saal Backtest: {csym} vs Nifty 50")
-        if st.button("📈 15 Saal Backtest Chalao", key="btn_single"):
-            with st.spinner("15 saal ka price data la raha hoon..."):
-                try:
-                    st.session_state["bt_single"] = (csym, run_backtest([csym], 15))
-                except Exception as e:
-                    st.error(f"Backtest fail: {e}")
-        if "bt_single" in st.session_state and st.session_state["bt_single"][0] == csym:
-            both_, stocks_ = st.session_state["bt_single"][1]
-            show_backtest(both_, stocks_, label=csym)
-
-# ================================================================== TAB 3
-with tab3:
-    st.write("Screener.in export (columns: Name, CMP, P/E, ROCE, Debt to equity, Sales growth 3Years, Profit growth 3Years).")
-    f = st.file_uploader("CSV/Excel upload karein", type=["csv", "xlsx"])
-    if f:
-        df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
-        df.columns = df.columns.str.strip()
-
-        def find(*keys, avoid=("qtr", "var %", "avg", "average", "median")):
-            """Screener ke alag-alag column naam pehchano (jaise 'ROCE %', 'Debt / Eq')."""
-            for c in df.columns:
-                lc = c.lower()
-                if all(k in lc for k in keys) and not any(a in lc for a in avoid):
-                    return c
+def _safe_hist(tk):
+    try:
+        d = yf.Ticker(tk).history(period="3y", auto_adjust=True)
+        if d.empty:
             return None
+        d.index = d.index.tz_localize(None) if d.index.tz is not None else d.index
+        return add_ind(d)
+    except Exception:
+        return None
 
-        mapping = {
-            "Name": find("name") or find("company"),
-            "Price": find("cmp") or find("current price"),
-            "PE": find("p/e") or find("price to earning"),
-            "ROCE": find("roce", avoid=("qtr", "var %", "avg", "average", "median", "3yr", "5yr", "7yr", "10yr")) or find("return on capital"),
-            "ROCE_5Y": find("roce", "5yr", avoid=("qtr", "var %")) or find("roce", "5year", avoid=("qtr",)),
-            "DE": find("debt", "eq"),
-            "Sales_CAGR": find("sales", "growth") or find("sales", "cagr"),
-            "Profit_CAGR": find("profit", "growth") or find("profit", "cagr"),
-        }
-        df = df.rename(columns={v: k for k, v in mapping.items() if v})
-        st.caption("Pehchane gaye columns: " + ", ".join(f"{k} ← {v}" for k, v in mapping.items() if v))
-        for c in ["PE", "ROCE", "ROCE_5Y", "DE", "Sales_CAGR", "Profit_CAGR"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        if not {"ROCE", "PE", "DE"}.issubset(df.columns):
-            st.error("ROCE, P/E aur Debt/Equity columns nahi mile. Screener me Edit Columns se inhe add karke dobara export karein.")
+
+def tab_backtest(sb):
+    st.subheader("15-Year Backtest vs Nifty 50")
+    st.warning("⚠️ Look-ahead / survivorship bias: the portfolio is today's Top 15 applied to history, so results "
+               "are optimistic. Use this as a stress-test of the style, not as expected returns. Weights are "
+               "equal; fundamentals are not re-scored historically (Yahoo has only ~4 years of statements).")
+    top = st.session_state.get("top")
+    if top is None:
+        st.info("Run the scanner first.")
+        return
+    if st.button("▶ Run Backtest", type="primary"):
+        with st.spinner("Downloading 15 years of prices..."):
+            prices, bench = fetch_prices(list(top["Ticker"]), sb["start"])
+        if prices.empty or bench.empty:
+            st.error("Price download failed.")
+            return
+        st.session_state["bt"] = backtest(prices, bench, sb["capital"], sb["sip"], sb["freq"], sb["trend"],
+                                          sb["cost"] / 100)
+        st.session_state["bt_n"] = prices.shape[1]
+    bt = st.session_state.get("bt")
+    if bt is None:
+        return
+    s, b = metrics(bt["s_curve"]), metrics(bt["b_curve"])
+    passed = s["CAGR"] > b["CAGR"] and s["Sharpe"] > b["Sharpe"] and s["MDD"] >= b["MDD"] - 0.05
+    (st.success if passed else st.error)(
+        f"{'✅ STRATEGY PASSED' if passed else '❌ STRATEGY FAILED'} — CAGR {s['CAGR']:.1%} vs {b['CAGR']:.1%}, "
+        f"Sharpe {s['Sharpe']:.2f} vs {b['Sharpe']:.2f}, MaxDD {s['MDD']:.1%} vs {b['MDD']:.1%}")
+    c = st.columns(4)
+    c[0].metric("Strategy CAGR", f"{s['CAGR']:.1%}", f"Alpha {100 * (s['CAGR'] - b['CAGR']):+.1f} pts")
+    c[1].metric("Nifty 50 CAGR", f"{b['CAGR']:.1%}")
+    c[2].metric("Final Value", f"₹{bt['s_val']:,.0f}", f"Invested ₹{bt['invested']:,.0f}", delta_color="off")
+    c[3].metric("Nifty Final Value", f"₹{bt['b_val']:,.0f}")
+    st.dataframe(pd.DataFrame({"Strategy": s, "Nifty 50": b}).drop("dd").assign(
+        Strategy=lambda d: d["Strategy"].astype(float).round(3), **{"Nifty 50": lambda d: d["Nifty 50"].astype(float).round(3)}),
+        use_container_width=True)
+    f = go.Figure()
+    f.add_scatter(x=bt["idx"], y=bt["s_curve"], name="Strategy (TWR)", line=dict(color="#00d4aa"))
+    f.add_scatter(x=bt["idx"], y=bt["b_curve"], name="Nifty 50", line=dict(color="#ff9f1c"))
+    f.update_layout(title="Growth of ₹1 (time-weighted, SIP-neutral)", yaxis_type="log")
+    st.plotly_chart(fig_style(f), use_container_width=True)
+    f = go.Figure()
+    f.add_scatter(x=bt["idx"], y=s["dd"] * 100, name="Strategy", fill="tozeroy", line=dict(color="#ef476f"))
+    f.add_scatter(x=bt["idx"], y=b["dd"] * 100, name="Nifty 50", line=dict(color="#ff9f1c"))
+    f.update_layout(title="Underwater plot (drawdown %)")
+    st.plotly_chart(fig_style(f, 320), use_container_width=True)
+    ys, yb = yearly(bt["s_curve"]), yearly(bt["b_curve"])
+    z = [ys.values, yb.values, (ys - yb).values]
+    f = go.Figure(go.Heatmap(z=z, x=[str(y) for y in ys.index], y=["Strategy", "Nifty 50", "Excess"],
+                             colorscale="RdYlGn", zmid=0, text=np.round(z, 1), texttemplate="%{text}",
+                             colorbar=dict(title="%")))
+    f.update_layout(title="Year-by-year returns (%)")
+    st.plotly_chart(fig_style(f, 280), use_container_width=True)
+
+
+def tab_deepdive(sb):
+    st.subheader("Single-Stock Deep Dive")
+    top = st.session_state.get("top")
+    opts = list(top["Ticker"]) if top is not None else []
+    c1, c2 = st.columns([2, 2])
+    pick = c1.selectbox("From Top 15", [""] + opts)
+    typed = c2.text_input("...or any NSE ticker (e.g. TCS)").strip().upper()
+    tk = (typed + ("" if typed.endswith(".NS") else ".NS")) if typed else pick
+    if not tk:
+        return
+    with st.spinner("Loading..."):
+        m = (top[top["Ticker"] == tk].iloc[0].to_dict() if top is not None and tk in set(top["Ticker"])
+             else fetch_one(tk))
+        if "error" in m:
+            st.error(f"Could not fetch fundamentals: {m['error']}")
+            return
+        m.setdefault("Score", score_stock(m))
+        h = get_hist(tk, "5y")
+    if h is None:
+        st.error("No price history.")
+        return
+    sig, why = signal_for(h, m)
+    pe_med = hist_pe_median(tk, m.get("PE"))
+    c = st.columns(5)
+    c[0].metric("Signal", sig)
+    c[1].metric("Score", f"{m['Score']:.0f}/100")
+    c[2].metric("PEG", "n/a" if pd.isna(m.get("PEG")) else f"{m['PEG']:.2f}")
+    c[3].metric("P/E vs hist. median", "n/a" if pd.isna(m.get("PE")) else f"{m['PE']:.1f}",
+                None if pd.isna(pe_med) else f"median {pe_med:.1f}", delta_color="off")
+    c[4].metric("RSI d / w", f"{h['RSI'].iloc[-1]:.0f} / {h['RSIW'].iloc[-1]:.0f}")
+    st.caption("Reasons: " + "; ".join(why))
+    buy, trim, sell = tech_series(h, m["Score"], m.get("PEG", NAN))
+    ent = lambda s: s & ~s.shift(1, fill_value=False)
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=[0.5, 0.15, 0.17, 0.18], vertical_spacing=0.02)
+    fig.add_candlestick(x=h.index, open=h["Open"], high=h["High"], low=h["Low"], close=h["Close"], name="Price", row=1, col=1)
+    for col, clr in [("EMA50", "#00b4d8"), ("EMA200", "#ff9f1c"), ("SMA20W", "#c77dff"), ("BBU", "#555"), ("BBL", "#555")]:
+        fig.add_scatter(x=h.index, y=h[col], name=col, line=dict(color=clr, width=1), row=1, col=1)
+    for s_, nm, sym, clr, off in [(ent(buy), "BUY", "triangle-up", "#06d6a0", 0.97), (ent(trim), "TRIM", "diamond", "#ffd166", 1.03),
+                                  (ent(sell), "SELL", "triangle-down", "#ef476f", 1.03)]:
+        fig.add_scatter(x=h.index[s_], y=h["Close"][s_] * off, mode="markers", name=nm, row=1, col=1,
+                        marker=dict(symbol=sym, size=12, color=clr, line=dict(width=1, color="white")))
+    vc = np.where(h["Close"] >= h["Open"], "#06d6a0", "#ef476f")
+    fig.add_bar(x=h.index, y=h["Volume"], marker_color=vc, name="Volume", row=2, col=1)
+    fig.add_scatter(x=h.index, y=h["RSI"], name="RSI", line=dict(color="#00b4d8"), row=3, col=1)
+    for lv in (30, 70):
+        fig.add_hline(y=lv, line_dash="dot", line_color="#666", row=3, col=1)
+    fig.add_bar(x=h.index, y=h["MHIST"], name="MACD hist", marker_color=np.where(h["MHIST"] >= 0, "#06d6a0", "#ef476f"), row=4, col=1)
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_layout(title=f"{tk} — technical-only markers (fundamentals held at current values)")
+    st.plotly_chart(fig_style(fig, 820), use_container_width=True)
+    st.caption("Volume breakout today: " + ("YES" if h["VOLX"].iloc[-1] > 1.5 else "no") +
+               f" ({h['VOLX'].iloc[-1]:.1f}x 20d avg)")
+
+
+def sidebar():
+    sb = {}
+    st.sidebar.header("⚙️ Universe")
+    sb["mode"] = st.sidebar.radio("Mode", ["Live scan (Yahoo)", "Screener.in CSV"])
+    sb["tickers"], sb["file"], sb["limit"] = [], None, 100
+    if sb["mode"] == "Live scan (Yahoo)":
+        src = st.sidebar.selectbox("Universe", ["Built-in list"] + list(NSE_URLS) + ["Upload ticker list"])
+        sb["limit"] = st.sidebar.slider("Max stocks", 10, 1000, 100, 10)
+        if src == "Built-in list":
+            sb["tickers"] = [t + ".NS" for t in BUILTIN]
+        elif src in NSE_URLS:
+            try:
+                req = urllib.request.Request(NSE_URLS[src], headers={"User-Agent": "Mozilla/5.0"})
+                d = pd.read_csv(io.BytesIO(urllib.request.urlopen(req, timeout=20).read()))
+                sb["tickers"] = [s.strip() + ".NS" for s in d["Symbol"]]
+            except Exception as e:
+                st.sidebar.error(f"NSE download failed ({e}). Upload the CSV manually.")
         else:
-            m = (df["ROCE"] >= roce_min) & (df["DE"] <= de_max) & (df["PE"] > 0) & (df["PE"] < pe_max)
-            if "Sales_CAGR" in df: m &= df["Sales_CAGR"] >= growth_min
-            if "Profit_CAGR" in df: m &= df["Profit_CAGR"] >= growth_min
-            basis = "ROCE_5Y" if "ROCE_5Y" in df.columns and df["ROCE_5Y"].notna().any() else "ROCE"
-            out = rank_score(df[m], roce_col=basis).head(top_n)
-            st.subheader(f"🏆 Top {len(out)} stocks (ranking: {basis} + Earnings Yield)")
-            st.dataframe(out, use_container_width=True)
+            up = st.sidebar.file_uploader("CSV with Symbol/Ticker column", type="csv", key="tk")
+            if up is not None:
+                d = pd.read_csv(up)
+                col = next((c for c in d.columns if c.lower() in ("symbol", "ticker", "nse code")), d.columns[0])
+                sb["tickers"] = [str(s).strip().upper().replace(".NS", "") + ".NS" for s in d[col]]
+    else:
+        sb["file"] = st.sidebar.file_uploader("Screener.in export (CSV)", type="csv", key="scr")
+        st.sidebar.download_button("⬇ CSV template", csv_template().to_csv(index=False), "screener_template.csv")
+    sb["min_score"] = st.sidebar.slider("Min composite score", 0, 90, 40)
+    sb["fin"] = st.sidebar.checkbox("Include Banks/NBFC (ROE + P/B scoring)", True)
+    st.sidebar.header("📈 Backtest")
+    sb["capital"] = st.sidebar.number_input("Initial capital ₹", 10000, 100000000, 100000, 10000)
+    sb["sip"] = st.sidebar.number_input("Monthly SIP ₹", 0, 10000000, 15000, 1000)
+    sb["freq"] = st.sidebar.selectbox("Rebalance", ["Annual", "Semi-Annual", "Buy-and-Hold"])
+    sb["trend"] = st.sidebar.checkbox("200-DMA weekly trend filter (exit to Liquid @6%)", False)
+    sb["cost"] = st.sidebar.number_input("Friction per trade (%)", 0.0, 2.0, 0.25, 0.05)
+    sb["start"] = st.sidebar.text_input("Start date", "2011-01-01")
+    return sb
 
-            st.divider()
-            st.subheader(f"📈 15 Saal Backtest: ye {len(out)} stocks vs Nifty 50")
-            if "Name" not in out.columns:
-                st.warning("File me company ka naam (Name/Company) column nahi mila, isliye symbol nahi dhoondh sakta.")
-            else:
-                sym_col = next((c for c in df.columns if any(k in c.lower() for k in ("nse", "symbol", "ticker"))), None)
-                names = out["Name"].astype(str).tolist()
-                mkey = "|".join(names)
-                if st.session_state.get("map_key") != mkey:
-                    with st.spinner("Company ke naam se NSE symbol dhoondh raha hoon..."):
-                        try:
-                            nm_map = nse_name_map()
-                        except Exception:
-                            nm_map = None
-                        if sym_col:
-                            guesses = out[sym_col].astype(str).str.replace(".NS", "", regex=False).tolist()
-                        else:
-                            guesses = [guess_ticker(n, nm_map) for n in names]
-                    st.session_state["map_df"] = pd.DataFrame({"Company": names, "NSE Symbol": guesses})
-                    st.session_state["map_key"] = mkey
-                st.caption("Symbol galat ya khaali ho to neeche table me khud sahi kar dein (jaise COALINDIA, HINDZINC). "
-                           "Khaali wale stock backtest me nahi judenge.")
-                edited = st.data_editor(st.session_state["map_df"], key=f"map_{abs(hash(mkey))}",
-                                        use_container_width=True, hide_index=True)
-                if st.button("📈 15 Saal Backtest Chalao (Nifty 50 se compare)", key="btn_file"):
-                    syms = [str(x).strip().upper() for x in edited["NSE Symbol"]
-                            if str(x).strip() and str(x).strip().lower() != "nan"]
-                    if not syms:
-                        st.error("Koi symbol nahi hai. Table me NSE symbol bharein.")
-                    else:
-                        with st.spinner("15 saal ka price data la raha hoon..."):
-                            try:
-                                st.session_state["bt_file"] = run_backtest(syms, 15)
-                            except Exception as e:
-                                st.error(f"Backtest fail: {e}")
-                if "bt_file" in st.session_state:
-                    show_backtest(*st.session_state["bt_file"], label="Top stocks")
 
-# ================================================================== TAB 4
-with tab4:
-    st.markdown("""
-### Yeh strategy kya hai
-- **Greenblatt Magic Formula:** high ROCE (achha business) + high Earnings Yield (sasta daam), dono ranks jodo.
-- **Buffett-style safety:** kam karza, saalon se badhti sales/profit. Yahan **growth rank** bhi jodi gayi hai.
-- **Fair value:** 3 models (Graham Number, Lynch PEG, 10-yr DCF) ka median. Yeh **andaza** hai, sachchai nahi.
+def main():
+    st.set_page_config(page_title="CoffeeCan + GARP Quant Scanner", page_icon="☕", layout="wide")
+    st.markdown("<style>.stApp{background:#0e1117;color:#e6e6e6}[data-testid=stMetricValue]{font-size:1.4rem}</style>",
+                unsafe_allow_html=True)
+    st.title("☕ CoffeeCan + GARP Quant Scanner & 15-Year Backtester")
+    st.caption("NSE • Educational research tool, not investment advice.")
+    sb = sidebar()
+    t1, t2, t3, t4 = st.tabs(["🔎 Scanner", "📊 Backtest", "🕯 Deep Dive", "📄 CSV Template"])
+    with t1:
+        tab_scanner(sb)
+    with t2:
+        tab_backtest(sb)
+    with t3:
+        tab_deepdive(sb)
+    with t4:
+        st.write("Export your Screener.in screen with these columns (names are matched case-insensitively):")
+        st.dataframe(csv_template(), hide_index=True)
+        st.download_button("Download template", csv_template().to_csv(index=False), "screener_template.csv", key="t4")
 
-### Signal kaise banta hai
-| Price / Fair Value | Signal |
-|---|---|
-| <= 0.70 | 🟢 STRONG BUY |
-| 0.70 – 0.85 | 🟢 BUY |
-| 0.85 – 1.10 | 🟡 HOLD |
-| 1.10 – 1.30 | 🟠 OVERVALUED |
-| > 1.30 | 🔴 SELL / TRIM |
-| ROCE < 12, Debt/Equity > 1 ya Profit CAGR < 0 | 🔴 SELL / REVIEW (price kuch bhi ho) |
 
-### Kab sell karein (Buffett/Greenblatt ke hisaab se)
-1. **Business bigad gaya** (ROCE giri, karza badha, profit ghat raha) → sabse bada sell reason.
-2. **Bahut mehnga ho gaya** (price fair value se 30%+ upar) → thoda profit book karein.
-3. **Usse behtar stock mila** → badlein (Greenblatt: saal me ek baar rebalance).
-4. Sirf price girne par sell nahi, pehle dekhein ki business kharab hua ya sirf mood.
-
-### Limits (zaroor padhein)
-- **Backtest me look-ahead bias:** aaj ke chune stocks par purana test hai, isliye result zyada achha dikhta hai.
-- **Banks/NBFC/Insurance** par Debt/Equity aur ROCE ke rules fit nahi baithte. Yeh screen unhe galat tareeke se hata ya chun sakta hai.
-- **Cyclical companies** (metals, commodities) peak earnings par sasta dikhti hain (low P/E) aur phir girti hain.
-- Yahoo ka free data kabhi galat/adhura hota hai. Kharidne se pehle Screener.in aur annual report dekhein.
-- Greenblatt ka formula bhi **3-5 saal ke kamzor daur** de sakta hai. Sabr aur diversification (15-30 stocks) zaroori hai.
-- Yeh educational tool hai, investment advice nahi.
-""")
+if __name__ == "__main__":
+    main()
